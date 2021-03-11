@@ -66,6 +66,12 @@ class auth_plugin_ldap_syncplus extends auth_plugin_ldap {
     }
 
 
+    function win_filetime_to_timestamp($filetime) {
+        $win_secs = substr($filetime,0,strlen($filetime)-7); // divide by 10 000 000 to get seconds
+        $unix_timestamp = ($win_secs - 11644473600); // 1.1.1600 -> 1.1.1970 difference in seconds
+        return $unix_timestamp;
+    }
+
     /**
      * Syncronizes user fron external LDAP server to moodle user table
      *
@@ -101,7 +107,7 @@ class auth_plugin_ldap_syncplus extends auth_plugin_ldap {
         // Prepare some data we'll need.
         $filter = '(&('.$this->config->user_attribute.'=*)'.$this->config->objectclass.')';
         $servercontrols = array();
-
+		$datesum = time();
         $contexts = explode(';', $this->config->contexts);
 
         if (!empty($this->config->create_context)) {
@@ -118,7 +124,7 @@ class auth_plugin_ldap_syncplus extends auth_plugin_ldap {
 
             do {
                 if ($ldappagedresults) {
-                    // TODO: Remove the old branch of code once PHP 7.3.0 becomes required (Moodle 3.11).
+                    // TODO: Remove the old branch of code once PHP 7.3.0 becomes required (Moodle 4.1).
                     if (version_compare(PHP_VERSION, '7.3.0', '<')) {
                         // Before 7.3, use this function that was deprecated in PHP 7.4.
                         ldap_control_paged_result($ldapconnection, $this->config->pagesize, true, $ldapcookie);
@@ -131,7 +137,7 @@ class auth_plugin_ldap_syncplus extends auth_plugin_ldap {
                 }
                 if ($this->config->search_sub) {
                     // Use ldap_search to find first user from subtree.
-                    // TODO: Remove the old branch of code once PHP 7.3.0 becomes required (Moodle 3.11).
+                    // TODO: Remove the old branch of code once PHP 7.3.0 becomes required (Moodle 4.1).
                     if (version_compare(PHP_VERSION, '7.3.0', '<')) {
                         $ldapresult = ldap_search($ldapconnection, $context, $filter, array($this->config->user_attribute));
                     } else {
@@ -140,7 +146,7 @@ class auth_plugin_ldap_syncplus extends auth_plugin_ldap {
                     }
                 } else {
                     // Search only in this context.
-                    // TODO: Remove the old branch of code once PHP 7.3.0 becomes required (Moodle 3.11).
+                    // TODO: Remove the old branch of code once PHP 7.3.0 becomes required (Moodle 4.1).
                     if (version_compare(PHP_VERSION, '7.3.0', '<')) {
                         $ldapresult = ldap_list($ldapconnection, $context, $filter, array($this->config->user_attribute));
                     } else {
@@ -154,7 +160,7 @@ class auth_plugin_ldap_syncplus extends auth_plugin_ldap {
                 if ($ldappagedresults) {
                     // Get next server cookie to know if we'll need to continue searching.
                     $ldapcookie = '';
-                    // TODO: Remove the old branch of code once PHP 7.3.0 becomes required (Moodle 3.11).
+                    // TODO: Remove the old branch of code once PHP 7.3.0 becomes required (Moodle 4.1).
                     if (version_compare(PHP_VERSION, '7.3.0', '<')) {
                         // Before 7.3, use this function that was deprecated in PHP 7.4.
                         $pagedresp = ldap_control_paged_result_response($ldapconnection, $ldapresult, $ldapcookie);
@@ -177,7 +183,28 @@ class auth_plugin_ldap_syncplus extends auth_plugin_ldap {
                         $value = ldap_get_values_len($ldapconnection, $entry, $this->config->user_attribute);
                         $value = core_text::convert($value[0], $this->config->ldapencoding, 'utf-8');
                         $value = trim($value);
-                        $this->ldap_bulk_insert($value);
+                        // > HsH peter werner - ignore duplicated entries and user with expired account
+                        $attrs = ldap_get_attributes($ldapconnection, $entry);
+                        if($DB->count_records_select('tmp_extuser','username=?',array('uname'=>$value))<1){
+                            if(isset($attrs['accountExpires'])){
+                                        $expdate = $attrs['accountExpires'][0];                                         
+                                        if($expdate <= 0){
+                                                $expdate = 0;
+                                        } else {
+                                                $expdate = $this->win_filetime_to_timestamp($expdate);
+                                        }
+                                        if($expdate != 0 && $expdate - $datesum < 0){
+                                                mtrace($value.' expires in '.($expdate-$datesum). ' not adding to tmp_extuser');
+                                        } else {
+                                                $this->ldap_bulk_insert($value); // only one result!
+                                        }
+                                } else {
+                                    $this->ldap_bulk_insert($value);
+                                }
+                        } else {
+                                 // duplicated! trace name to output
+                            mtrace('Duplicated entry: '.$value);
+                        }
                     } while ($entry = ldap_next_entry($ldapconnection, $entry));
                 }
                 unset($ldapresult); // Free mem.
@@ -451,7 +478,9 @@ class auth_plugin_ldap_syncplus extends auth_plugin_ldap {
                     //
                     // The cast to int is a workaround for MDL-53959.
                     $user->suspended = (int)$this->is_user_suspended($user);
-
+                    if (empty($user->lang)) {
+                        $user->lang = $CFG->lang;
+                    }
                     if (empty($user->calendartype)) {
                         $user->calendartype = $CFG->calendartype;
                     }
